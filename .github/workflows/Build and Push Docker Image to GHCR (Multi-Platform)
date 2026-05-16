@@ -1,0 +1,95 @@
+name: Build and Push Docker Image to GHCR (Multi-Platform)
+
+# 触发条件
+on:
+  push:
+    branches: [ "main" ]  # 推送到main分支时触发
+    tags: [ 'v*.*.*' ]    # 创建v开头的语义化标签时触发(如v1.0.0)
+  pull_request:
+    branches: [ "main" ]  # 提交PR到main分支时仅构建不推送
+  workflow_dispatch:      # 允许从GitHub网页手动触发
+
+# 全局环境变量
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}  # 自动获取"用户名/仓库名"格式
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    
+    # 🔴 关键：必须明确声明这些权限，否则GITHUB_TOKEN无法推送镜像
+    permissions:
+      contents: read       # 允许读取仓库代码
+      packages: write      # 允许向GHCR推送镜像
+      id-token: write      # 用于验证镜像来源(可选但推荐)
+
+    steps:
+      # 步骤1：检出仓库代码
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # 🔴 新增：设置QEMU模拟器(多平台构建必需)
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          # 只安装需要的平台模拟器，加快构建速度
+          platforms: arm64,amd64
+
+      # 步骤2：设置Docker Buildx(支持多平台构建和缓存)
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          # 启用BuildKit的多平台构建支持
+          driver-opts: |
+            network=host
+            env.BUILDKIT_STEP_LOG_MAX_SIZE=10485760
+
+      # 步骤3：登录到GitHub容器仓库(使用内置GITHUB_TOKEN)
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}  # 自动使用触发工作流的用户
+          password: ${{ secrets.GITHUB_TOKEN }}  # 🔑 使用GitHub自动生成的临时令牌
+
+      # 步骤4：自动生成镜像标签和元数据
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # 智能标签策略
+          tags: |
+            type=semver,pattern={{version}}    # 推送tag时使用版本号(如v1.0.0)
+            type=semver,pattern={{major}}.{{minor}}  # 同时生成v1.0标签
+            type=ref,event=branch              # 推送到分支时使用分支名
+            type=sha,format=short,prefix=sha-  # 总是添加git短提交哈希
+            type=raw,value=latest,enable={{is_default_branch}}  # 仅默认分支添加latest
+          # 自动添加标准标签
+          labels: |
+            org.opencontainers.image.title=${{ github.event.repository.name }}
+            org.opencontainers.image.description=${{ github.event.repository.description }}
+            org.opencontainers.image.url=${{ github.event.repository.html_url }}
+            org.opencontainers.image.source=${{ github.event.repository.html_url }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=${{ github.event.repository.license.spdx_id }}
+
+      # 步骤5：构建并推送多平台镜像
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          # 🔴 新增：指定要构建的平台
+          platforms: linux/amd64,linux/arm64
+          # 仅在非PR且非手动触发时推送镜像
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # 启用GitHub Actions缓存，大幅加速后续构建
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # 可选：添加构建参数
+          # build-args: |
+          #   APP_VERSION=${{ steps.meta.outputs.version }}
+          #   BUILD_TIME=${{ steps.meta.outputs.created }}
