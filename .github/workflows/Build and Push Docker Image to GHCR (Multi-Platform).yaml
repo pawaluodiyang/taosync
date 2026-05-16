@@ -1,95 +1,323 @@
-name: Build and Push Docker Image to GHCR (Multi-Platform)
+name: 构建
 
-# 触发条件
 on:
   push:
-    branches: [ "main" ]  # 推送到main分支时触发
-    tags: [ 'v*.*.*' ]    # 创建v开头的语义化标签时触发(如v1.0.0)
-  pull_request:
-    branches: [ "main" ]  # 提交PR到main分支时仅构建不推送
-  workflow_dispatch:      # 允许从GitHub网页手动触发
+    branches: [ 'main' ]
+    paths: [ 'version.txt' ]
 
-# 全局环境变量
+# 必须添加这个权限配置，才能推送到GHCR
+permissions:
+  contents: write
+  packages: write
+
 env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}  # 自动获取"用户名/仓库名"格式
+  APP_NAME: taoSync
+  # GHCR 配置
+  GHCR_REGISTRY: ghcr.io
+  GHCR_USER: ${{ github.actor }}
+  GHCR_NAME: ${{ github.repository }}
 
 jobs:
-  build-and-push:
+  get-version:
+    name: 获取版本号
     runs-on: ubuntu-latest
-    
-    # 🔴 关键：必须明确声明这些权限，否则GITHUB_TOKEN无法推送镜像
-    permissions:
-      contents: read       # 允许读取仓库代码
-      packages: write      # 允许向GHCR推送镜像
-      id-token: write      # 用于验证镜像来源(可选但推荐)
+    outputs:
+      TAG_LIST: ${{ steps.getVersion.outputs.TAG_LIST }}
+      VERSION: ${{ steps.getVersion.outputs.VERSION }}
 
     steps:
-      # 步骤1：检出仓库代码
-      - name: Checkout code
+      - name: 检出仓库代码
         uses: actions/checkout@v4
 
-      # 🔴 新增：设置QEMU模拟器(多平台构建必需)
-      - name: Set up QEMU
+      - id: getVersion
+        name: 获取版本号
+        run: |
+          versions=$(head -n 1 version.txt)
+          tagList=""
+          IFS=',' read -ra versionList <<< "$versions"
+          cuVersion="${versionList[0]}"
+          for version in "${versionList[@]}"; do
+            tagList+="-t $GHCR_REGISTRY/$GHCR_NAME:$version "
+          done
+          echo "TAG_LIST=$tagList" >> "$GITHUB_OUTPUT"
+          echo "VERSION=$cuVersion" >> "$GITHUB_OUTPUT"
+
+  build-frontend:
+    name: 构建前端
+    runs-on: ubuntu-latest
+    needs: [ get-version ]
+    env:
+      VERSION: ${{ needs.get-version.outputs.VERSION }}
+
+    steps:
+      - name: 检出仓库代码
+        uses: actions/checkout@v4
+
+      - name: 安装Node.js 14.x
+        uses: actions/setup-node@v4
+        with:
+          node-version: "14.x"
+
+      - name: 安装依赖并构建前端
+        run: |
+          sed -i "s/__version_placeholder__/$VERSION/g" frontend/src/views/page/setting/index.vue
+          cd frontend
+          npm install
+          npm run build
+
+      - name: 上传artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist
+          retention-days: 1
+
+  build-docker:
+    name: 构建Docker与linux
+    runs-on: ubuntu-latest
+    needs: [ get-version, build-frontend ]
+    env:
+      VERSION: ${{ needs.get-version.outputs.VERSION }}
+    strategy:
+      matrix:
+        platform:
+          - linux/amd64
+          - linux/arm64
+          - linux/arm/v7
+          - linux/386
+          - linux/arm/v6
+          - linux/s390x
+          - linux/ppc64le
+
+    steps:
+      - name: 替换平台名称中的斜杠为横杠
+        run: |
+          platform=${{ matrix.platform }}
+          echo "PLATFORM_PAIR=${platform//\//-}" >> $GITHUB_ENV
+
+      - name: 设置QEMU
         uses: docker/setup-qemu-action@v3
-        with:
-          # 只安装需要的平台模拟器，加快构建速度
-          platforms: arm64,amd64
 
-      # 步骤2：设置Docker Buildx(支持多平台构建和缓存)
-      - name: Set up Docker Buildx
+      - name: 设置Docker BuildX
         uses: docker/setup-buildx-action@v3
-        with:
-          # 启用BuildKit的多平台构建支持
-          driver-opts: |
-            network=host
-            env.BUILDKIT_STEP_LOG_MAX_SIZE=10485760
 
-      # 步骤3：登录到GitHub容器仓库(使用内置GITHUB_TOKEN)
-      - name: Log in to GHCR
+      - name: 登录到GHCR
         uses: docker/login-action@v3
         with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}  # 自动使用触发工作流的用户
-          password: ${{ secrets.GITHUB_TOKEN }}  # 🔑 使用GitHub自动生成的临时令牌
+          registry: ${{ env.GHCR_REGISTRY }}
+          username: ${{ env.GHCR_USER }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      # 步骤4：自动生成镜像标签和元数据
-      - name: Extract Docker metadata
-        id: meta
-        uses: docker/metadata-action@v5
+      - name: 检出仓库代码
+        uses: actions/checkout@v4
+
+      - name: 下载前端
+        uses: actions/download-artifact@v4
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          # 智能标签策略
-          tags: |
-            type=semver,pattern={{version}}    # 推送tag时使用版本号(如v1.0.0)
-            type=semver,pattern={{major}}.{{minor}}  # 同时生成v1.0标签
-            type=ref,event=branch              # 推送到分支时使用分支名
-            type=sha,format=short,prefix=sha-  # 总是添加git短提交哈希
-            type=raw,value=latest,enable={{is_default_branch}}  # 仅默认分支添加latest
-          # 自动添加标准标签
-          labels: |
-            org.opencontainers.image.title=${{ github.event.repository.name }}
-            org.opencontainers.image.description=${{ github.event.repository.description }}
-            org.opencontainers.image.url=${{ github.event.repository.html_url }}
-            org.opencontainers.image.source=${{ github.event.repository.html_url }}
-            org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.licenses=${{ github.event.repository.license.spdx_id }}
+          name: frontend-dist
+          path: frontend/dist
 
-      # 步骤5：构建并推送多平台镜像
-      - name: Build and push Docker image
+      - id: build-image
+        name: 构建docker镜像
         uses: docker/build-push-action@v6
         with:
           context: .
-          # 🔴 新增：指定要构建的平台
-          platforms: linux/amd64,linux/arm64
-          # 仅在非PR且非手动触发时推送镜像
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          # 启用GitHub Actions缓存，大幅加速后续构建
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          # 可选：添加构建参数
-          # build-args: |
-          #   APP_VERSION=${{ steps.meta.outputs.version }}
-          #   BUILD_TIME=${{ steps.meta.outputs.created }}
+          platforms: ${{ matrix.platform }}
+          outputs: |
+            type=docker
+            type=image,name=${{ env.GHCR_REGISTRY }}/${{ env.GHCR_NAME }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: 导出digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build-image.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: 上传digest到artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ env.PLATFORM_PAIR }}
+          path: /tmp/digests/*
+          retention-days: 1
+
+      - name: 从镜像中提取可执行文件
+        run: |
+          docker create --name tmp ${{ steps.build-image.outputs.imageid }} /bin/true
+          docker cp tmp:/app/${{ env.APP_NAME }} ${{ env.APP_NAME }}
+          tar czf "$APP_NAME-$VERSION-$PLATFORM_PAIR.tar.gz" ${{ env.APP_NAME }}
+
+      - name: 上传可执行文件到artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ env.PLATFORM_PAIR }}
+          path: ${{ env.APP_NAME }}-${{ env.VERSION }}-${{ env.PLATFORM_PAIR }}.tar.gz
+          retention-days: 1
+
+  merge-docker:
+    name: 合并Docker镜像
+    runs-on: ubuntu-latest
+    needs: [get-version, build-docker]
+    env:
+      TAG_LIST: ${{ needs.get-version.outputs.TAG_LIST }}
+    steps:
+      - name: 下载digest
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: 设置Docker BuildX
+        uses: docker/setup-buildx-action@v3
+
+      - name: 登录到GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.GHCR_REGISTRY }}
+          username: ${{ env.GHCR_USER }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 创建GHCR清单并推送
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create ${{ env.TAG_LIST }}$(printf '${{ env.GHCR_REGISTRY }}/${{ env.GHCR_NAME }}@sha256:%s ' *)
+
+  build-windows:
+    name: 构建windows
+    strategy:
+      matrix:
+        os:
+          - windows-latest
+          - windows-11-arm
+    runs-on: ${{ matrix.os }}
+    needs: [get-version, build-frontend]
+    env:
+      VERSION: ${{needs.get-version.outputs.VERSION}}
+    if: ${{ !contains(needs.get-version.outputs.VERSION, 'dev') }}
+
+    steps:
+      - name: 判断平台
+        run: |
+          $os = "${{ matrix.os }}"
+          if ($os -eq "windows-latest") {
+            $PLATFORM = "amd64"
+          } else {
+            $PLATFORM = "arm64"
+          }
+          "PLATFORM=$PLATFORM" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: 检出仓库代码
+        uses: actions/checkout@v4
+
+      - name: 下载前端
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist
+
+      - name: 设置python环境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安装依赖并构建打包
+        run: |
+          python -m pip install 'pyinstaller>=6,<7'
+          python -m pip install -r requirements.txt
+          python -m PyInstaller ${{ env.APP_NAME }}.spec
+          cd dist && 7z a ${{ env.APP_NAME }}-${{ env.VERSION }}-windows-${{ env.PLATFORM }}.zip *
+
+      - name: 上传artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-windows-${{ env.PLATFORM }}
+          path: dist/*.zip
+
+  build-darwin:
+    name: 构建darwin
+    strategy:
+      matrix:
+        os:
+          - macos-15-intel
+          - macos-14
+    runs-on: ${{ matrix.os }}
+    needs: [get-version, build-frontend]
+    env:
+      VERSION: ${{needs.get-version.outputs.VERSION}}
+    if: ${{ !contains(needs.get-version.outputs.VERSION, 'dev') }}
+
+    steps:
+      - name: 判断平台
+        run: |
+          os=${{ matrix.os }}
+          if [ "$os" = "macos-15-intel" ]; then
+            PLATFORM="amd64"
+          else
+            PLATFORM="arm64"
+          fi
+          echo "PLATFORM=$PLATFORM" >> $GITHUB_ENV
+
+      - name: 检出仓库代码
+        uses: actions/checkout@v4
+
+      - name: 下载前端
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist
+
+      - name: 设置python环境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安装依赖并构建打包
+        run: |
+          python -m pip install 'pyinstaller>=6,<7'
+          python -m pip install -r requirements.txt
+          python -m PyInstaller "$APP_NAME.spec"
+          cd dist
+          tar czf "$APP_NAME-$VERSION-darwin-$PLATFORM.tar.gz" .
+
+      - name: 上传artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-darwin-${{ env.PLATFORM }}
+          path: dist/*.tar.gz
+          retention-days: 1
+
+  create-release:
+    name: 发布release
+    runs-on: ubuntu-latest
+    needs: [get-version, build-windows, build-darwin, build-docker]
+    env:
+      VERSION: ${{needs.get-version.outputs.VERSION}}
+    if: ${{ !contains(needs.get-version.outputs.VERSION, 'dev') }}
+    steps:
+      - name: 检出仓库代码
+        uses: actions/checkout@v4
+
+      - name: 下载构建结果
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: 没有版本日志文件自动创建
+        run: |
+          version_first=$(echo $VERSION | cut -d'-' -f1)
+          LOG_FILE="doc/changelog/$version_first.md"
+          if [ ! -f "$LOG_FILE" ]; then
+            touch "$LOG_FILE"
+            echo "$VERSION" > "$LOG_FILE"
+          fi
+          echo "LOG_FILE=$LOG_FILE" >> "$GITHUB_ENV"
+
+      - name: 创建release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.VERSION }}
+          files: dist/*
+          body_path: ${{ env.LOG_FILE }}
+          prerelease: ${{ contains(env.VERSION, 'dev') || contains(env.VERSION, 'pre') || contains(env.VERSION, 'beta') }}
